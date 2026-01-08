@@ -23,14 +23,15 @@ function xmlEscape(s = "") {
     .replaceAll("'", "&apos;");
 }
 
-// ============ TWILIO WEBHOOK: /voice ============
+// ---------- HTTP ----------
+app.get("/ping", (_req, res) => res.status(200).send("pong"));
+
 app.post("/voice", (req, res) => {
-  const raw = (process.env.WEBSOCKET_URL || "").trim();
-  if (!raw) {
+  const wsUrl = (process.env.WEBSOCKET_URL || "").trim();
+
+  if (!wsUrl) {
     res.type("text/xml").send(`<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Say>Erreur: WEBSOCKET_URL manquant.</Say>
-</Response>`);
+<Response><Say>Erreur: WEBSOCKET_URL manquant.</Say></Response>`);
     return;
   }
 
@@ -40,22 +41,20 @@ app.post("/voice", (req, res) => {
     ${xmlEscape("Bienvenue chez ABC Déneigement. Dites-moi comment je peux vous aider.")}
   </Say>
   <Connect>
-    <Stream url="${xmlEscape(raw)}" />
+    <Stream url="${xmlEscape(wsUrl)}" />
   </Connect>
 </Response>`;
 
-  process.stdout.write("📞 /voice hit\n");
-  process.stdout.write(`WEBSOCKET_URL=${raw}\n`);
-  process.stdout.write("TwiML sent:\n" + twiml + "\n");
+  console.log("📞 /voice hit");
+  console.log("WEBSOCKET_URL=", wsUrl);
+  console.log("TwiML sent:\n", twiml);
 
   res.type("text/xml").send(twiml);
 });
 
-// ============ HEALTHCHECK ============
-app.get("/ping", (req, res) => res.status(200).send("pong"));
-
-// ============ UPGRADE -> /ws ============
+// ---------- WS upgrade ----------
 server.on("upgrade", (req, socket, head) => {
+  console.log("⬆️ UPGRADE hit url=", req.url);
   if (req.url === "/ws") {
     wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
   } else {
@@ -63,212 +62,139 @@ server.on("upgrade", (req, socket, head) => {
   }
 });
 
-// ============ MAIN WS HANDLER (Twilio <-> OpenAI Realtime) ============
+// ---------- Twilio WS <-> OpenAI Realtime ----------
 wss.on("connection", (twilioWs) => {
-  process.stdout.write("✅ Twilio WS connected\n");
+  console.log("✅ Twilio WS connected");
 
   let streamSid = null;
   let openaiWs = null;
 
-  let locked = false;        // empêche response.create en boucle
-  let playing = false;       // AI est en train de parler (audio en cours)
-  let totalAudioDeltas = 0;  // debug
+  const key = (process.env.OPENAI_API_KEY || "").trim();
+  if (!key) {
+    console.log("❌ Missing OPENAI_API_KEY");
+    try { twilioWs.close(); } catch {}
+    return;
+  }
 
-  function twilioSend(obj) {
+  const model = (process.env.OPENAI_REALTIME_MODEL || "gpt-realtime").trim();
+
+  const twilioSend = (obj) => {
     if (twilioWs.readyState === WebSocket.OPEN) {
       twilioWs.send(JSON.stringify(obj));
     }
-  }
+  };
 
-  function twilioClear() {
-    if (!streamSid) return;
-    twilioSend({ event: "clear", streamSid }); // coupe le buffer Twilio :contentReference[oaicite:2]{index=2}
-  }
-
-  function openaiSend(obj) {
+  const openaiSend = (obj) => {
     if (openaiWs && openaiWs.readyState === WebSocket.OPEN) {
       openaiWs.send(JSON.stringify(obj));
     }
-  }
+  };
 
-  function openaiCancel() {
-    // stoppe une réponse en cours côté OpenAI
-    openaiSend({ type: "response.cancel" });
-  }
+  let locked = false;
+  let audioDeltaCount = 0;
 
   function connectOpenAI() {
-    const key = (process.env.OPENAI_API_KEY || "").trim();
-    if (!key) {
-      process.stdout.write("❌ Missing OPENAI_API_KEY\n");
-      return;
-    }
-
-    // IMPORTANT: modèle realtime GA (audio + text)
-    // Si tu veux plus cheap: gpt-4o-mini-realtime-preview
-    // (les 2 existent dans la doc modèles) :contentReference[oaicite:3]{index=3}
-    const model = process.env.OPENAI_REALTIME_MODEL?.trim() || "gpt-realtime";
-
-    openaiWs = new WebSocket(`wss://api.openai.com/v1/realtime?model=${encodeURIComponent(model)}`, {
-      headers: {
-        Authorization: `Bearer ${key}`,
-      },
-    });
+    openaiWs = new WebSocket(
+      `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(model)}`,
+      { headers: { Authorization: `Bearer ${key}` } }
+    );
 
     openaiWs.on("open", () => {
-      process.stdout.write("🧠 OpenAI Realtime connected\n");
+      console.log("🧠 OpenAI Realtime connected");
 
-      // Session config (GA): output_modalities + formats + VAD + voice :contentReference[oaicite:4]{index=4}
       openaiSend({
         type: "session.update",
         session: {
-          type: "realtime",
-          model,
-          output_modalities: ["audio", "text"],
-          audio: {
-            input: {
-              format: { type: "audio/pcmu" }, // Twilio = mulaw/8000 :contentReference[oaicite:5]{index=5}
-              turn_detection: { type: "semantic_vad" },
-            },
-            output: {
-              format: { type: "audio/pcmu" }, // renvoyer direct à Twilio :contentReference[oaicite:6]{index=6}
-              voice: "marin", // top qualité (ou cedar) :contentReference[oaicite:7]{index=7}
-            },
-          },
+          // garde simple et compatible
+          modalities: ["audio", "text"],
+          input_audio_format: "g711_ulaw",
+          output_audio_format: "g711_ulaw",
+          turn_detection: { type: "server_vad" },
+          voice: "alloy",
           instructions:
             "Tu es l'agent service client d'ABC Déneigement (Montréal). " +
-            "Converse naturellement en français (Québec). " +
+            "Réponds naturellement en français québécois. " +
             "Heures: Lun-Ven 8h30-17h00. Fermé Sam-Dim. " +
-            "Si on te demande un rendez-vous avant 8h30 ou le weekend: refuse poliment et propose un créneau en semaine. " +
-            "Si tu n'as pas l'info (ex: nombre exact de camions): dis-le et propose de transférer à un superviseur. " +
-            "Sois bref, clair, et pro.",
+            "Si RDV hors heures: propose un créneau en semaine. " +
+            "Si info inconnue: propose transfert superviseur.",
         },
       });
+
+      openaiSend({ type: "input_audio_buffer.clear" });
     });
 
     openaiWs.on("message", (raw) => {
       let evt;
-      try {
-        evt = JSON.parse(raw.toString());
-      } catch {
+      try { evt = JSON.parse(raw.toString()); } catch { return; }
+
+      if (evt.type === "error") {
+        console.log("OpenAI error:", evt);
         return;
       }
 
-      const t = evt.type;
-
-      // Debug minimal utile
-      if (t === "error") {
-        process.stdout.write("OpenAI error: " + JSON.stringify(evt, null, 2) + "\n");
-      }
-
-      // Barge-in: si l’utilisateur parle pendant que l’AI parle, on coupe l’audio en cours
-      if (t === "input_audio_buffer.speech_started") {
-        process.stdout.write("🎙️ speech_started (barge-in)\n");
-        if (playing) {
-          openaiCancel();
-          twilioClear();
-          playing = false;
-          locked = false;
-        }
-      }
-
-      // Quand OpenAI a “committed” le tour (VAD), on lance une réponse si pas déjà en cours
-      if (t === "input_audio_buffer.committed") {
-        process.stdout.write("✅ committed (VAD)\n");
-
+      // Quand VAD commit -> create response (une fois)
+      if (evt.type === "input_audio_buffer.committed") {
+        console.log("✅ committed");
         if (!locked) {
           locked = true;
-          totalAudioDeltas = 0;
-          openaiSend({ type: "response.create" });
-          process.stdout.write("🗣️ response.create sent\n");
-        } else {
-          process.stdout.write("⚠️ locked -> skip response.create\n");
+          audioDeltaCount = 0;
+          openaiSend({ type: "response.create", response: { modalities: ["audio", "text"], voice: "alloy" } });
+          console.log("🗣️ response.create sent");
         }
       }
 
-      // Audio chunks -> renvoyer à Twilio (sinon tu n’entends rien)
-      if (t === "response.output_audio.delta") {
-        const b64 = evt.delta; // base64 audio (pcmu)
-        if (b64 && streamSid) {
-          totalAudioDeltas++;
-          playing = true;
-          twilioSend({
-            event: "media",
-            streamSid,
-            media: { payload: b64 }, // Twilio attend mulaw/8000 base64 :contentReference[oaicite:8]{index=8}
-          });
-        }
+      // Audio delta -> Twilio
+      if ((evt.type === "response.output_audio.delta" || evt.type === "response.audio.delta") && evt.delta && streamSid) {
+        audioDeltaCount++;
+        if (audioDeltaCount === 1) console.log("🔊 first audio delta received");
+
+        twilioSend({
+          event: "media",
+          streamSid,
+          media: { payload: evt.delta },
+        });
       }
 
-      // Fin audio
-      if (t === "response.output_audio.done") {
-        process.stdout.write(`🔊 output_audio.done | audio deltas=${totalAudioDeltas}\n`);
-        playing = false;
-      }
-
-      // Fin response -> unlock
-      if (t === "response.done") {
-        process.stdout.write("✅ response.done (unlock)\n");
+      // Fin réponse -> unlock
+      if (evt.type === "response.done") {
+        console.log("✅ response.done | audio deltas=", audioDeltaCount);
         locked = false;
+        openaiSend({ type: "input_audio_buffer.clear" });
       }
     });
 
-    openaiWs.on("close", () => {
-      process.stdout.write("🧠 OpenAI Realtime disconnected\n");
-      openaiWs = null;
-      locked = false;
-      playing = false;
-    });
-
-    openaiWs.on("error", (e) => {
-      process.stdout.write("🧠 OpenAI WS error: " + (e?.message || String(e)) + "\n");
-    });
+    openaiWs.on("close", () => console.log("🧠 OpenAI Realtime disconnected"));
+    openaiWs.on("error", (e) => console.log("🧠 OpenAI WS error:", e?.message || e));
   }
 
-  // ==== TWILIO -> SERVER EVENTS ====
   twilioWs.on("message", (raw) => {
     let msg;
-    try {
-      msg = JSON.parse(raw.toString());
-    } catch {
-      return;
-    }
+    try { msg = JSON.parse(raw.toString()); } catch { return; }
 
     if (msg.event === "start") {
       streamSid = msg?.start?.streamSid;
-      process.stdout.write(`▶️ Twilio stream start sid=${streamSid}\n`);
+      console.log("▶️ Twilio stream start sid=", streamSid);
       connectOpenAI();
       return;
     }
 
-    if (msg.event === "media") {
-      const payload = msg?.media?.payload;
-      if (payload && openaiWs && openaiWs.readyState === WebSocket.OPEN) {
-        // envoyer audio inbound à OpenAI
-        openaiSend({
-          type: "input_audio_buffer.append",
-          audio: payload,
-        });
-      }
+    if (msg.event === "media" && msg.media?.payload) {
+      openaiSend({ type: "input_audio_buffer.append", audio: msg.media.payload });
       return;
     }
 
     if (msg.event === "stop") {
-      process.stdout.write("⏹️ Twilio stream stop\n");
-      try { openaiCancel(); } catch {}
+      console.log("⏹️ Twilio stream stop");
       try { openaiWs?.close(); } catch {}
       return;
     }
   });
 
   twilioWs.on("close", () => {
-    process.stdout.write("❌ Twilio WS disconnected\n");
-    try { openaiCancel(); } catch {}
+    console.log("❌ Twilio WS disconnected");
     try { openaiWs?.close(); } catch {}
   });
 });
 
-// ============ START SERVER ============
-server.listen(PORT, () => {
-  process.stdout.write(`🚀 Server listening on ${PORT}\n`);
-});
-
+// ✅ UN SEUL listen ici
+server.listen(PORT, () => console.log(`🚀 Server listening on ${PORT}`));
