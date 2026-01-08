@@ -74,7 +74,7 @@ wss.on("connection", (twilioWs) => {
 
   let streamSid = null;
 
-  // Queue si OpenAI pas prêt
+  // Queue messages tant que OpenAI pas open
   const queue = [];
   const sendOpenAI = (obj) => {
     const s = JSON.stringify(obj);
@@ -82,28 +82,48 @@ wss.on("connection", (twilioWs) => {
     else queue.push(s);
   };
 
-  let locked = false;
+  // --- Silence timer (déclenche réponse après 800ms sans audio entrant) ---
+  let silenceTimer = null;
+  const SILENCE_MS = 800;
+
+  // --- Lock réponse (évite active_response) ---
+  let responseLocked = false;
+
+  function scheduleResponseCreate() {
+    if (silenceTimer) clearTimeout(silenceTimer);
+    silenceTimer = setTimeout(() => {
+      if (responseLocked) return;
+      responseLocked = true;
+      console.log("🗣️ Silence -> response.create");
+      sendOpenAI({
+        type: "response.create",
+        response: { modalities: ["audio", "text"] },
+      });
+    }, SILENCE_MS);
+  }
 
   openaiWs.on("open", () => {
     console.log("🧠 OpenAI Realtime connected");
-
     while (queue.length) openaiWs.send(queue.shift());
 
-    // ✅ SESSION.UPDATE sans session.type
+    // ✅ IMPORTANT: turn_detection NONE => on contrôle nous-mêmes le tour
     sendOpenAI({
       type: "session.update",
       session: {
         modalities: ["audio", "text"],
         input_audio_format: "g711_ulaw",
         output_audio_format: "g711_ulaw",
-        turn_detection: { type: "server_vad" },
+        turn_detection: { type: "none" },
         instructions:
-          "Tu es l’agent téléphonique de ABC Déneigement. Tu parles FR-CA, naturel et pro. " +
+          "Tu es l’agent téléphonique de ABC Déneigement. FR-CA naturel et pro. " +
           "Heures: lun-ven 08:30-17:00, fermé samedi/dimanche. " +
-          "Si demande RDV hors heures, propose un créneau valide. " +
-          "Si info inconnue (ex: nombre de camions), dis-le et propose transfert superviseur.",
+          "Si RDV hors heures, propose un créneau valide. " +
+          "Si info inconnue, propose transfert superviseur.",
       },
     });
+
+    // Optionnel: vider buffer au début
+    sendOpenAI({ type: "input_audio_buffer.clear" });
   });
 
   openaiWs.on("message", (raw) => {
@@ -112,30 +132,30 @@ wss.on("connection", (twilioWs) => {
 
     if (msg.type === "error") {
       console.log("OpenAI error:", msg);
+      // Si jamais encore active_response: on garde locked, et on attend done
+      if (msg?.error?.code === "conversation_already_has_active_response") {
+        responseLocked = true;
+      }
       return;
     }
 
-    if (msg.type === "input_audio_buffer.committed") {
-      console.log("✅ committed");
-      if (!locked) {
-        locked = true;
-        console.log("🗣️ response.create");
-        sendOpenAI({ type: "response.create", response: { modalities: ["audio", "text"] } });
-      }
-    }
-
-    // ✅ AUDIO AI -> TWILIO
+    // 🔊 Audio OpenAI -> Twilio
     if (msg.type === "response.output_audio.delta" && msg.delta && streamSid) {
       twilioWs.send(JSON.stringify({
         event: "media",
         streamSid,
-        media: { payload: msg.delta }
+        media: { payload: msg.delta },
       }));
+      return;
     }
 
+    // Unlock quand fini
     if (msg.type === "response.done" || msg.type === "response.output_audio.done") {
-      locked = false;
-      console.log("✅ done (unlock)");
+      responseLocked = false;
+      console.log("✅ response.done (unlock)");
+      // Clear l’input buffer pour repartir clean
+      sendOpenAI({ type: "input_audio_buffer.clear" });
+      return;
     }
   });
 
@@ -151,13 +171,27 @@ wss.on("connection", (twilioWs) => {
     }
 
     if (data.event === "media" && data.media?.payload) {
+      // Si l’AI est en train de répondre et l’humain parle, on coupe la réponse
+      if (responseLocked) {
+        console.log("🎙️ user barged-in -> response.cancel");
+        sendOpenAI({ type: "response.cancel" });
+        responseLocked = false;
+        // clear output côté AI (évite overlap)
+        sendOpenAI({ type: "output_audio_buffer.clear" });
+      }
+
+      // append audio
       sendOpenAI({ type: "input_audio_buffer.append", audio: data.media.payload });
+
+      // chaque chunk reçu repousse le timer => on répond après silence
+      scheduleResponseCreate();
       return;
     }
 
     if (data.event === "stop") {
       console.log("⏹️ Twilio stream stop");
       try { openaiWs.close(); } catch {}
+      return;
     }
   });
 
@@ -168,6 +202,7 @@ wss.on("connection", (twilioWs) => {
 
   openaiWs.on("close", () => console.log("🧠 OpenAI Realtime disconnected"));
 });
+
 
 
 
