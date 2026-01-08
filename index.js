@@ -9,20 +9,25 @@ app.use(bodyParser.json());
 
 // --- 1) Webhook Twilio: quand un appel arrive ---
 app.post("/voice", (req, res) => {
-  // IMPORTANT: Twilio veut un WSS public, et un chemin /ws
-  const wsUrl = process.env.WEBSOCKET_URL; // ex: wss://xxx.up.railway.app/ws
+  console.log("📞 /voice hit");
+  console.log("WEBSOCKET_URL =", process.env.WEBSOCKET_URL);
+
+  const wsUrl = process.env.WEBSOCKET_URL;
 
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Start>
     <Stream url="${wsUrl}" />
   </Start>
-  <Say voice="Polly.Gabrielle-Neural" language="fr-CA">Bienvenue chez ABC Déneigement. Dites-moi comment je peux vous aider.</Say>
-  <Pause length="60"/>
+  <Say voice="Polly.Chantal" language="fr-CA">
+    Bienvenue chez ABC Déneigement. Dites-moi comment je peux vous aider.
+  </Say>
+  <Pause length="600"/>
 </Response>`;
 
   res.type("text/xml").send(twiml);
 });
+
 
 // --- 2) HTTP server (unique port Railway) ---
 const server = http.createServer(app);
