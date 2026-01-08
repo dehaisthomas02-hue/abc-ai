@@ -21,7 +21,8 @@ app.post("/voice", (req, res) => {
   process.stdout.write("📞 /voice hit\n");
   process.stdout.write(`WEBSOCKET_URL=${process.env.WEBSOCKET_URL}\n`);
 
-  const wsUrl = process.env.WEBSOCKET_URL;
+  const wsUrl = (process.env.WEBSOCKET_URL || "").trim();
+
 
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
