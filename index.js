@@ -48,34 +48,19 @@ server.on("upgrade", (req, socket, head) => {
 
 // --- 4) Réception Twilio Media Streams ---
 wss.on("connection", (ws) => {
-  console.log("✅ Twilio WS connected");
+  process.stdout.write("✅ Twilio WS connected\n");
 
   ws.on("message", (msg) => {
-    // Twilio envoie JSON: start / media / stop
-    try {
-      const data = JSON.parse(msg.toString());
+    const s = msg.toString();
 
-      if (data.event === "start") {
-        console.log("▶️ stream start", data.start?.streamSid);
-      }
-
-      if (data.event === "media") {
-        // IMPORTANT: data.media.payload = base64 audio mulaw 8khz
-        // Ici on branchera STT + AI + TTS (prochaine étape)
-        // Pour l’instant on log juste la réception
-        // console.log("🎧 media chunk", data.media?.payload?.length);
-      }
-
-      if (data.event === "stop") {
-        console.log("⏹️ stream stop");
-      }
-    } catch (e) {
-      console.log("WS message non-JSON:", msg.toString());
-    }
+    if (s.includes('"event":"start"')) process.stdout.write("▶️ start event\n");
+    if (s.includes('"event":"media"')) process.stdout.write("🎧 media chunk\n");
+    if (s.includes('"event":"stop"')) process.stdout.write("⏹️ stop event\n");
   });
 
-  ws.on("close", () => console.log("❌ Twilio WS disconnected"));
+  ws.on("close", () => process.stdout.write("❌ Twilio WS disconnected\n"));
 });
+
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => console.log(`🚀 Server listening on ${PORT}`));
