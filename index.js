@@ -1,3 +1,15 @@
+"scripts": {
+  "start": "node index.js"
+}
+
+process.on("uncaughtException", (err) => {
+  console.error("UNCAUGHT EXCEPTION:", err);
+});
+process.on("unhandledRejection", (reason) => {
+  console.error("UNHANDLED REJECTION:", reason);
+});
+
+
 import express from "express";
 import bodyParser from "body-parser";
 import http from "http";
@@ -61,9 +73,9 @@ wss.on("connection", (ws) => {
   ws.on("close", () => process.stdout.write("❌ Twilio WS disconnected\n"));
 });
 
-
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => console.log(`🚀 Server listening on ${PORT}`));
+
 
 app.get("/ping", (req, res) => {
   process.stdout.write("🏓 /ping hit\n");
