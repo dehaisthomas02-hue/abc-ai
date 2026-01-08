@@ -24,6 +24,7 @@ app.get("/ping", (_req, res) => res.status(200).send("pong"));
 
 app.post("/voice", (req, res) => {
   const wsUrl = getWsUrl(req);
+
   console.log("📞 /voice hit");
   console.log("WEBSOCKET_URL=", wsUrl);
 
@@ -60,6 +61,7 @@ wss.on("connection", (twilioWs) => {
     return;
   }
 
+  // Si tu veux, force un modèle explicitement dans Railway: OPENAI_MODEL
   const OPENAI_MODEL = (process.env.OPENAI_MODEL || "gpt-realtime").trim();
 
   const openaiWs = new WebSocket(
@@ -74,7 +76,7 @@ wss.on("connection", (twilioWs) => {
 
   let streamSid = null;
 
-  // Queue tant que OpenAI pas OPEN
+  // Queue si OpenAI pas encore OPEN
   const queue = [];
   const sendOpenAI = (obj) => {
     const s = JSON.stringify(obj);
@@ -82,16 +84,26 @@ wss.on("connection", (twilioWs) => {
     else queue.push(s);
   };
 
-  // lock anti "active_response"
+  // Lock réponse
   let responseLocked = false;
 
-  // si l'utilisateur parle
-  let userSpeaking = false;
+  // Audio delta counter (debug)
+  let audioDeltaCount = 0;
+
+  // log types (évite spam)
+  let typeLogCount = 0;
+  function logTypeOnce(msgType) {
+    if (typeLogCount < 25) {
+      console.log("📩 OpenAI evt:", msgType);
+      typeLogCount++;
+    }
+  }
 
   openaiWs.on("open", () => {
     console.log("🧠 OpenAI Realtime connected");
     while (queue.length) openaiWs.send(queue.shift());
 
+    // ✅ Session config la plus compatible (pas de session.type / output_modalities)
     sendOpenAI({
       type: "session.update",
       session: {
@@ -99,11 +111,16 @@ wss.on("connection", (twilioWs) => {
         input_audio_format: "g711_ulaw",
         output_audio_format: "g711_ulaw",
         turn_detection: { type: "server_vad" },
+
+        // Beaucoup de comptes acceptent "voice" ici. Si jamais ça errore, enlève juste cette ligne.
+        voice: "alloy",
+
         instructions:
-          "Tu es l’agent téléphonique de ABC Déneigement. FR-CA naturel et pro. " +
+          "Tu es l’agent téléphonique de ABC Déneigement (fr-CA). " +
+          "Réponds de façon humaine, polie, concise. " +
           "Heures: lun-ven 08:30-17:00, fermé samedi/dimanche. " +
           "Si RDV hors heures, propose un créneau valide. " +
-          "Si info inconnue, propose transfert superviseur.",
+          "Si info inconnue (ex: nombre de camions), dis-le et propose transfert superviseur.",
       },
     });
 
@@ -114,22 +131,20 @@ wss.on("connection", (twilioWs) => {
     let msg;
     try { msg = JSON.parse(raw.toString()); } catch { return; }
 
+    if (msg?.type) logTypeOnce(msg.type);
+
     if (msg.type === "error") {
       console.log("OpenAI error:", msg);
-
-      // si OpenAI dit "active response", on garde lock et on attend done
+      // si active response, on garde lock jusqu'à done
       if (msg?.error?.code === "conversation_already_has_active_response") {
         responseLocked = true;
       }
       return;
     }
 
-    // OpenAI détecte début/fin parole utilisateur (server_vad)
+    // Barge-in
     if (msg.type === "input_audio_buffer.speech_started") {
-      userSpeaking = true;
       console.log("🎙️ speech_started");
-
-      // Si AI est en train de parler, on coupe pour laisser l'utilisateur
       if (responseLocked) {
         sendOpenAI({ type: "response.cancel" });
         sendOpenAI({ type: "output_audio_buffer.clear" });
@@ -140,41 +155,55 @@ wss.on("connection", (twilioWs) => {
     }
 
     if (msg.type === "input_audio_buffer.speech_stopped") {
-      userSpeaking = false;
-      console.log("🎙️ speech_stopped -> try response.create");
-
-      // ✅ C'EST ICI qu'on déclenche, pas sur committed
+      console.log("🎙️ speech_stopped -> response.create");
       if (!responseLocked) {
         responseLocked = true;
         sendOpenAI({
           type: "response.create",
-          response: { modalities: ["audio", "text"] },
+          response: {
+            modalities: ["audio", "text"],
+            // Beaucoup de comptes acceptent voice ici aussi (plus stable).
+            voice: "alloy",
+          },
         });
       }
       return;
     }
 
-    // 🔊 Audio AI -> Twilio
-    if (msg.type === "response.output_audio.delta" && msg.delta && streamSid) {
-      twilioWs.send(
-        JSON.stringify({
-          event: "media",
-          streamSid,
-          media: { payload: msg.delta },
-        })
-      );
+    // ✅ Attrape TOUS les noms d'events audio possibles
+    const audioDelta =
+      (msg.type === "response.output_audio.delta" && msg.delta) ? msg.delta :
+      (msg.type === "response.audio.delta" && msg.delta) ? msg.delta :
+      (msg.type === "response.audio.delta" && msg.audio) ? msg.audio :
+      null;
+
+    if (audioDelta && streamSid) {
+      audioDeltaCount++;
+      if (audioDeltaCount <= 3) {
+        console.log("🔊 audio delta -> Twilio (sample)", audioDelta.slice(0, 16), "...");
+      }
+      // Pour confirmer que ça sort, toutes les 50 deltas:
+      if (audioDeltaCount % 50 === 0) {
+        console.log(`🔊 audio deltas sent: ${audioDeltaCount}`);
+      }
+
+      twilioWs.send(JSON.stringify({
+        event: "media",
+        streamSid,
+        media: { payload: audioDelta },
+      }));
       return;
     }
 
     if (msg.type === "response.done" || msg.type === "response.output_audio.done") {
       responseLocked = false;
       console.log("✅ response.done (unlock)");
+      console.log("🔊 total audio deltas this call =", audioDeltaCount);
       sendOpenAI({ type: "input_audio_buffer.clear" });
       return;
     }
   });
 
-  // Twilio -> OpenAI (audio entrant)
   twilioWs.on("message", (raw) => {
     let data;
     try { data = JSON.parse(raw.toString()); } catch { return; }
@@ -204,6 +233,7 @@ wss.on("connection", (twilioWs) => {
 
   openaiWs.on("close", () => console.log("🧠 OpenAI Realtime disconnected"));
 });
+
 
 
 
