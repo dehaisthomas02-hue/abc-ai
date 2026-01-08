@@ -9,8 +9,8 @@ app.use(bodyParser.json());
 
 // --- 1) Webhook Twilio: quand un appel arrive ---
 app.post("/voice", (req, res) => {
-  console.log("📞 /voice hit");
-  console.log("WEBSOCKET_URL =", process.env.WEBSOCKET_URL);
+  process.stdout.write("📞 /voice hit\n");
+process.stdout.write(`WEBSOCKET_URL=${process.env.WEBSOCKET_URL}\n`);
 
   const wsUrl = process.env.WEBSOCKET_URL;
 
