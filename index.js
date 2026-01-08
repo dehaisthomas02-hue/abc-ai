@@ -126,22 +126,34 @@ wss.on("connection", (twilioWs) => {
     }
 
     // 2) EVENT CLÉ: committed = "tour terminé"
-    if (msg.type === "input_audio_buffer.committed") {
-      console.log("✅ committed (VAD) -> try response.create");
-      if (!responseLocked) {
-        responseLocked = true;
-        sendOpenAI({
-          type: "response.create",
-          response: {
-            modalities: ["audio", "text"],
-            voice: "alloy",
-          },
-        });
-      } else {
-        console.log("⚠️ already locked, skip response.create");
-      }
-      return;
-    }
+   if (msg.type === "input_audio_buffer.committed") {
+  console.log("✅ committed (VAD) -> force cancel + response.create");
+
+  // Bloque pour éviter spam
+  if (responseLocked) {
+    console.log("⚠️ already locked, skip");
+    return;
+  }
+  responseLocked = true;
+
+  // 1) On annule toute réponse auto en cours (sinon active_response)
+  sendOpenAI({ type: "response.cancel" });
+  sendOpenAI({ type: "output_audio_buffer.clear" });
+
+  // 2) Petit délai ultra court, puis on force NOTRE réponse audio
+  setTimeout(() => {
+    sendOpenAI({
+      type: "response.create",
+      response: {
+        modalities: ["audio", "text"],
+        voice: "alloy",
+      },
+    });
+  }, 80);
+
+  return;
+}
+
 
     // 3) AUDIO DELTA (OpenAI -> Twilio)
     const delta =
