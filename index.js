@@ -80,19 +80,14 @@ wss.on("connection", (twilioWs) => {
     }
   );
 
-  function requestAudioResponse() {
-    if (openaiWs.readyState !== WebSocket.OPEN) return;
+function requestAudioResponse() {
+  if (openaiWs.readyState !== WebSocket.OPEN) return;
+  openaiWs.send(JSON.stringify({
+    type: "response.create",
+    response: { modalities: ["audio", "text"] }
+  }));
+}
 
-    // Explicitly request AUDIO output
-    openaiWs.send(
-      JSON.stringify({
-        type: "response.create",
-        response: {
-          modalities: ["audio"],
-        },
-      })
-    );
-  }
 
   openaiWs.on("open", () => {
     process.stdout.write("🧠 OpenAI Realtime connected\n");
