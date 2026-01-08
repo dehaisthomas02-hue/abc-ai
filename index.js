@@ -15,7 +15,7 @@ process.on("unhandledRejection", (reason) => {
   console.error("UNHANDLED REJECTION:", reason);
 });
 
-// --- HTTP route: health ---
+// --- Health ---
 app.get("/ping", (req, res) => {
   process.stdout.write("🏓 /ping hit\n");
   res.status(200).send("pong");
@@ -28,7 +28,7 @@ app.post("/voice", (req, res) => {
   const wsUrl = (process.env.WEBSOCKET_URL || "").trim();
   process.stdout.write(`WEBSOCKET_URL=${wsUrl}\n`);
 
-  // ✅ FIX 1: use <Connect><Stream> so Twilio can play audio we send back on the WS
+  // ✅ Bidirectional stream: Twilio can play audio we send back over WS
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Say voice="Polly.Chantal" language="fr-CA">Bienvenue chez ABC Déneigement. Dites-moi comment je peux vous aider.</Say>
@@ -41,10 +41,10 @@ app.post("/voice", (req, res) => {
   res.type("text/xml").send(twiml);
 });
 
-// --- Create single HTTP server (Railway) ---
+// --- Single server ---
 const server = http.createServer(app);
 
-// --- WebSocket server attached to same port ---
+// --- WS server on same port ---
 const wss = new WebSocketServer({ noServer: true });
 
 server.on("upgrade", (req, socket, head) => {
@@ -60,12 +60,11 @@ server.on("upgrade", (req, socket, head) => {
   }
 });
 
-// --- Twilio Media Stream WS -> OpenAI Realtime bridge ---
+// --- Twilio <-> OpenAI Realtime bridge ---
 wss.on("connection", (twilioWs) => {
   process.stdout.write("✅ Twilio WS connected\n");
 
   let streamSid = null;
-  let openaiReady = false;
 
   const openaiKey = (process.env.OPENAI_API_KEY || "").trim();
   if (!openaiKey) {
@@ -73,6 +72,9 @@ wss.on("connection", (twilioWs) => {
     twilioWs.close();
     return;
   }
+
+  let openaiReady = false;
+  let responseInProgress = false; // ✅ anti-spam lock
 
   const openaiWs = new WebSocket(
     "wss://api.openai.com/v1/realtime?model=gpt-realtime",
@@ -87,7 +89,6 @@ wss.on("connection", (twilioWs) => {
   openaiWs.on("open", () => {
     process.stdout.write("🧠 OpenAI Realtime connected\n");
 
-    // Configure session (Twilio = g711_ulaw 8k)
     openaiWs.send(
       JSON.stringify({
         type: "session.update",
@@ -104,7 +105,6 @@ Règles :
           input_audio_format: "g711_ulaw",
           output_audio_format: "g711_ulaw",
           voice: "alloy",
-          // ✅ OpenAI does VAD server-side; when it commits, we'll trigger response.create
           turn_detection: { type: "server_vad" },
         },
       })
@@ -123,37 +123,52 @@ Règles :
 
     if (evt.type === "error") {
       console.log("OpenAI error:", evt);
+      // si erreur "active response", on ne panic pas; on garde le lock
       return;
     }
 
-    // ✅ FIX 2: when OpenAI commits the user's audio (server_vad), ask it to respond
+    // ✅ When OpenAI commits user audio (server_vad), trigger ONE response.create
     if (evt.type === "input_audio_buffer.committed") {
-      process.stdout.write("🗣️ OpenAI committed user audio -> response.create\n");
-      openaiWs.send(JSON.stringify({ type: "response.create" }));
+      if (!responseInProgress) {
+        responseInProgress = true;
+        process.stdout.write("🗣️ Commit -> response.create\n");
+        openaiWs.send(JSON.stringify({ type: "response.create" }));
+      } else {
+        process.stdout.write("⚠️ Commit ignored (response already in progress)\n");
+      }
       return;
     }
 
-    // OpenAI audio -> Twilio
+    // ✅ Unlock when response is done
+    if (evt.type === "response.done") {
+      responseInProgress = false;
+      process.stdout.write("✅ response.done (unlock)\n");
+      return;
+    }
+
+    // ✅ OpenAI audio -> Twilio
     if (evt.type === "response.audio.delta" && evt.delta && streamSid) {
+      process.stdout.write("🔊 audio delta -> Twilio\n");
       twilioWs.send(
         JSON.stringify({
           event: "media",
           streamSid,
-          media: { payload: evt.delta },
+          media: { payload: evt.delta }, // base64 g711_ulaw
         })
       );
       return;
     }
   });
 
-  openaiWs.on("close", () => {
-    process.stdout.write("🧠 OpenAI Realtime disconnected\n");
-  });
-
   openaiWs.on("error", (err) => {
     console.log("OpenAI WS error:", err);
   });
 
+  openaiWs.on("close", () => {
+    process.stdout.write("🧠 OpenAI Realtime disconnected\n");
+  });
+
+  // Twilio -> OpenAI
   twilioWs.on("message", (msg) => {
     let data;
     try {
@@ -169,7 +184,9 @@ Règles :
     }
 
     if (data.event === "media") {
-      // Forward audio to OpenAI
+      // ✅ If AI is speaking, ignore user audio to avoid commit spam
+      if (responseInProgress) return;
+
       if (openaiWs.readyState === WebSocket.OPEN && openaiReady) {
         openaiWs.send(
           JSON.stringify({
@@ -183,7 +200,6 @@ Règles :
 
     if (data.event === "stop") {
       process.stdout.write("⏹️ Twilio stream stop\n");
-      // With <Connect><Stream>, stop generally happens at hangup; we close OpenAI then.
       try {
         openaiWs.close();
       } catch {}
@@ -205,5 +221,6 @@ Règles :
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => console.log(`🚀 Server listening on ${PORT}`));
+
 
 
