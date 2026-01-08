@@ -1,3 +1,12 @@
+import express from "express";
+import bodyParser from "body-parser";
+import http from "http";
+import { WebSocketServer } from "ws";
+import WebSocket from "ws";
+
+const app = express();
+app.use(bodyParser.urlencoded({ extended: false }));
+app.use(bodyParser.json());
 
 process.on("uncaughtException", (err) => {
   console.error("UNCAUGHT EXCEPTION:", err);
@@ -6,32 +15,25 @@ process.on("unhandledRejection", (reason) => {
   console.error("UNHANDLED REJECTION:", reason);
 });
 
-import WebSocket from "ws";
-import express from "express";
-import bodyParser from "body-parser";
-import http from "http";
-import { WebSocketServer } from "ws";
+// --- HTTP route: health ---
+app.get("/ping", (req, res) => {
+  process.stdout.write("🏓 /ping hit\n");
+  res.status(200).send("pong");
+});
 
-const app = express();
-app.use(bodyParser.urlencoded({ extended: false }));
-app.use(bodyParser.json());
-
-// --- 1) Webhook Twilio: quand un appel arrive ---
+// --- Twilio voice webhook ---
 app.post("/voice", (req, res) => {
   process.stdout.write("📞 /voice hit\n");
-  process.stdout.write(`WEBSOCKET_URL=${process.env.WEBSOCKET_URL}\n`);
 
   const wsUrl = (process.env.WEBSOCKET_URL || "").trim();
-
+  process.stdout.write(`WEBSOCKET_URL=${wsUrl}\n`);
 
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Start>
     <Stream url="${wsUrl}" />
   </Start>
-  <Say voice="Polly.Chantal" language="fr-CA">
-    Bienvenue chez ABC Déneigement. Dites-moi comment je peux vous aider.
-  </Say>
+  <Say voice="Polly.Chantal" language="fr-CA">Bienvenue chez ABC Déneigement. Dites-moi comment je peux vous aider.</Say>
   <Pause length="600"/>
 </Response>`;
 
@@ -39,10 +41,10 @@ app.post("/voice", (req, res) => {
   res.type("text/xml").send(twiml);
 });
 
-// --- 2) HTTP server (unique port Railway) ---
+// --- Create single HTTP server (Railway) ---
 const server = http.createServer(app);
 
-// --- 3) WebSocket server attaché au même serveur ---
+// --- WebSocket server attached to same port ---
 const wss = new WebSocketServer({ noServer: true });
 
 server.on("upgrade", (req, socket, head) => {
@@ -58,19 +60,24 @@ server.on("upgrade", (req, socket, head) => {
   }
 });
 
-
-// --- 4) Réception Twilio Media Streams ---
+// --- Twilio Media Stream WS -> OpenAI Realtime bridge ---
 wss.on("connection", (twilioWs) => {
   process.stdout.write("✅ Twilio WS connected\n");
 
   let streamSid = null;
 
-  // 🔌 Connexion OpenAI Realtime
+  const openaiKey = (process.env.OPENAI_API_KEY || "").trim();
+  if (!openaiKey) {
+    process.stdout.write("❌ Missing OPENAI_API_KEY\n");
+    twilioWs.close();
+    return;
+  }
+
   const openaiWs = new WebSocket(
     "wss://api.openai.com/v1/realtime?model=gpt-realtime",
     {
       headers: {
-        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+        Authorization: `Bearer ${openaiKey}`,
         "OpenAI-Beta": "realtime=v1",
       },
     }
@@ -79,7 +86,7 @@ wss.on("connection", (twilioWs) => {
   openaiWs.on("open", () => {
     process.stdout.write("🧠 OpenAI Realtime connected\n");
 
-    // 🎛️ Configuration de la session AI
+    // Configure session (Twilio = g711_ulaw 8k)
     openaiWs.send(
       JSON.stringify({
         type: "session.update",
@@ -87,12 +94,11 @@ wss.on("connection", (twilioWs) => {
           instructions: `
 Tu es l'agent téléphonique de ABC Déneigement.
 
-Règles importantes :
-- Heures d'ouverture : lundi à vendredi, 08:30 à 17:00
-- Fermé samedi et dimanche
-- Si quelqu’un demande un rendez-vous avant 08:30 ou après 17:00, propose le prochain créneau disponible
-- Si une information n’est pas disponible (ex: nombre de camions), dis-le honnêtement et propose de transférer à un superviseur
-- Ton ton est humain, naturel, professionnel, en français canadien
+Règles :
+- Heures: Lun-Ven 08:30-17:00. Fermé samedi/dimanche.
+- RDV: si quelqu’un demande avant 08:30 ou après 17:00, propose le prochain créneau dispo.
+- Si une info est inconnue (ex: nombre de camions), dis que tu n'as pas l'information et propose de transférer à un superviseur.
+- Style: humain, poli, efficace, FR-CA.
 `,
           input_audio_format: "g711_ulaw",
           output_audio_format: "g711_ulaw",
@@ -101,15 +107,22 @@ Règles importantes :
         },
       })
     );
-
-    // Lancer la première réponse (AI prête à parler)
-    openaiWs.send(JSON.stringify({ type: "response.create" }));
   });
 
-  // 🗣️ Audio OpenAI → Twilio
   openaiWs.on("message", (raw) => {
-    const evt = JSON.parse(raw.toString());
+    let evt;
+    try {
+      evt = JSON.parse(raw.toString());
+    } catch {
+      return;
+    }
 
+    if (evt.type === "error") {
+      console.log("OpenAI error:", evt);
+      return;
+    }
+
+    // OpenAI audio -> Twilio
     if (evt.type === "response.audio.delta" && evt.delta && streamSid) {
       twilioWs.send(
         JSON.stringify({
@@ -121,31 +134,64 @@ Règles importantes :
     }
   });
 
-  // 🎧 Audio Twilio → OpenAI
+  openaiWs.on("close", () => {
+    process.stdout.write("🧠 OpenAI Realtime disconnected\n");
+  });
+
+  openaiWs.on("error", (err) => {
+    console.log("OpenAI WS error:", err);
+  });
+
   twilioWs.on("message", (msg) => {
-  const data = JSON.parse(msg.toString());
+    let data;
+    try {
+      data = JSON.parse(msg.toString());
+    } catch {
+      return;
+    }
 
-  if (data.event === "start") {
-    streamSid = data.start.streamSid;
-    process.stdout.write("▶️ Twilio stream start\n");
-    return;
-  }
+    if (data.event === "start") {
+      streamSid = data.start?.streamSid || null;
+      process.stdout.write("▶️ Twilio stream start\n");
+      return;
+    }
 
-  if (data.event === "media") {
-    openaiWs.send(
-      JSON.stringify({
-        type: "input_audio_buffer.append",
-        audio: data.media.payload,
-      })
-    );
-    return;
-  }
+    if (data.event === "media") {
+      // Forward audio to OpenAI
+      if (openaiWs.readyState === WebSocket.OPEN) {
+        openaiWs.send(
+          JSON.stringify({
+            type: "input_audio_buffer.append",
+            audio: data.media?.payload,
+          })
+        );
+      }
+      return;
+    }
 
-  if (data.event === "stop") {
-    process.stdout.write("⏹️ Twilio stream stop\n");
+    if (data.event === "stop") {
+      process.stdout.write("⏹️ Twilio stream stop\n");
 
-    // 🔊 DEMANDER À L’AI DE RÉPONDRE
-    openaiWs.send(JSON.stringify({ type: "response.create" }));
-    return;
-  }
+      // Ask OpenAI to respond now
+      if (openaiWs.readyState === WebSocket.OPEN) {
+        openaiWs.send(JSON.stringify({ type: "response.create" }));
+      }
+      return;
+    }
+  });
+
+  twilioWs.on("close", () => {
+    process.stdout.write("❌ Twilio WS disconnected\n");
+    try {
+      openaiWs.close();
+    } catch {}
+  });
+
+  twilioWs.on("error", (err) => {
+    console.log("Twilio WS error:", err);
+  });
 });
+
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => console.log(`🚀 Server listening on ${PORT}`));
+
