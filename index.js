@@ -24,7 +24,6 @@ app.post("/voice", (req, res) => {
   const wsUrl = (process.env.WEBSOCKET_URL || "").trim();
   process.stdout.write(`WEBSOCKET_URL=${wsUrl}\n`);
 
-  // Bidirectional: Twilio can play audio sent back over WS
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Say voice="Polly.Chantal" language="fr-CA">Bienvenue chez ABC Déneigement. Dites-moi comment je peux vous aider.</Say>
@@ -45,7 +44,6 @@ const wss = new WebSocketServer({ noServer: true });
 
 server.on("upgrade", (req, socket, head) => {
   process.stdout.write(`⬆️ UPGRADE hit url=${req.url}\n`);
-
   if (req.url === "/ws") {
     wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
   } else {
@@ -80,24 +78,26 @@ wss.on("connection", (twilioWs) => {
     }
   );
 
-function requestAudioResponse() {
-  if (openaiWs.readyState !== WebSocket.OPEN) return;
-  openaiWs.send(JSON.stringify({
-    type: "response.create",
-    response: { modalities: ["audio", "text"] }
-  }));
-}
-
+  const MODALITIES = ["audio", "text"]; // ✅ ONLY supported combo
+  function requestResponse() {
+    if (openaiWs.readyState !== WebSocket.OPEN) return;
+    openaiWs.send(
+      JSON.stringify({
+        type: "response.create",
+        response: { modalities: MODALITIES },
+      })
+    );
+  }
 
   openaiWs.on("open", () => {
     process.stdout.write("🧠 OpenAI Realtime connected\n");
+    process.stdout.write(`🧩 session.modalities=${JSON.stringify(MODALITIES)}\n`);
 
-    // Force audio modality + ulaw formats
     openaiWs.send(
       JSON.stringify({
         type: "session.update",
         session: {
-          modalities: ["audio"], // <= important
+          modalities: MODALITIES,
           input_audio_format: "g711_ulaw",
           output_audio_format: "g711_ulaw",
           voice: "alloy",
@@ -126,33 +126,26 @@ Règles :
       return;
     }
 
-    // Optional: uncomment to see all event types
-    // process.stdout.write(`OpenAI evt: ${evt.type}\n`);
-
     if (evt.type === "error") {
       console.log("OpenAI error:", evt);
-
-      // If OpenAI says a response is already active, don't spam new creates.
       if (evt?.error?.code === "conversation_already_has_active_response") {
         responseInProgress = true;
-        process.stdout.write("⚠️ active response already in progress -> keep lock\n");
+        process.stdout.write("⚠️ active response in progress -> keep lock\n");
       }
       return;
     }
 
-    // When server_vad commits user audio, trigger ONE response at a time
     if (evt.type === "input_audio_buffer.committed") {
       if (!responseInProgress) {
         responseInProgress = true;
-        process.stdout.write("🗣️ Commit -> response.create (audio)\n");
-        requestAudioResponse();
+        process.stdout.write("🗣️ Commit -> response.create\n");
+        requestResponse();
       } else {
         process.stdout.write("⚠️ Commit ignored (response in progress)\n");
       }
       return;
     }
 
-    // Audio delta from OpenAI -> Twilio
     if (evt.type === "response.audio.delta" && evt.delta && streamSid) {
       process.stdout.write("🔊 audio delta -> Twilio\n");
       twilioWs.send(
@@ -165,7 +158,6 @@ Règles :
       return;
     }
 
-    // Unlock when the response is done
     if (evt.type === "response.done") {
       responseInProgress = false;
       process.stdout.write("✅ response.done (unlock)\n");
@@ -176,7 +168,6 @@ Règles :
   openaiWs.on("error", (err) => console.log("OpenAI WS error:", err));
   openaiWs.on("close", () => process.stdout.write("🧠 OpenAI Realtime disconnected\n"));
 
-  // Twilio -> OpenAI
   twilioWs.on("message", (msg) => {
     let data;
     try {
@@ -192,7 +183,6 @@ Règles :
     }
 
     if (data.event === "media") {
-      // While AI is speaking, ignore user audio (prevents new commits mid-response)
       if (responseInProgress) return;
       if (!openaiReady) return;
 
@@ -228,6 +218,7 @@ Règles :
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => console.log(`🚀 Server listening on ${PORT}`));
+
 
 
 
