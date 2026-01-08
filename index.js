@@ -45,15 +45,18 @@ const server = http.createServer(app);
 const wss = new WebSocketServer({ noServer: true });
 
 server.on("upgrade", (req, socket, head) => {
-  // On accepte seulement /ws
+  process.stdout.write(`⬆️ UPGRADE hit url=${req.url}\n`);
+
   if (req.url === "/ws") {
     wss.handleUpgrade(req, socket, head, (ws) => {
       wss.emit("connection", ws, req);
     });
   } else {
+    process.stdout.write("❌ UPGRADE rejected (not /ws)\n");
     socket.destroy();
   }
 });
+
 
 // --- 4) Réception Twilio Media Streams ---
 wss.on("connection", (ws) => {
