@@ -19,7 +19,7 @@ app.use(bodyParser.json());
 // --- 1) Webhook Twilio: quand un appel arrive ---
 app.post("/voice", (req, res) => {
   process.stdout.write("📞 /voice hit\n");
-process.stdout.write(`WEBSOCKET_URL=${process.env.WEBSOCKET_URL}\n`);
+  process.stdout.write(`WEBSOCKET_URL=${process.env.WEBSOCKET_URL}\n`);
 
   const wsUrl = process.env.WEBSOCKET_URL;
 
@@ -34,9 +34,9 @@ process.stdout.write(`WEBSOCKET_URL=${process.env.WEBSOCKET_URL}\n`);
   <Pause length="600"/>
 </Response>`;
 
+  process.stdout.write("TwiML sent:\n" + twiml + "\n");
   res.type("text/xml").send(twiml);
 });
-
 
 // --- 2) HTTP server (unique port Railway) ---
 const server = http.createServer(app);
