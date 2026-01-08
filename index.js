@@ -6,7 +6,7 @@ process.on("unhandledRejection", (reason) => {
   console.error("UNHANDLED REJECTION:", reason);
 });
 
-
+import WebSocket from "ws";
 import express from "express";
 import bodyParser from "body-parser";
 import http from "http";
