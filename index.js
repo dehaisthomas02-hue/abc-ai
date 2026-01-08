@@ -5,17 +5,14 @@ import WebSocket, { WebSocketServer } from "ws";
 
 dotenv.config();
 
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-if (!OPENAI_API_KEY) {
-  console.error("❌ Missing OPENAI_API_KEY");
-}
+const OPENAI_API_KEY = (process.env.OPENAI_API_KEY || "").trim();
+if (!OPENAI_API_KEY) console.error("❌ Missing OPENAI_API_KEY");
 
 const app = express();
 app.use(express.urlencoded({ extended: false }));
 
-/* =========================
-   TWILIO WEBHOOK /voice
-========================= */
+app.get("/ping", (req, res) => res.status(200).send("pong"));
+
 app.post("/voice", (req, res) => {
   const host = req.headers["x-forwarded-host"] || req.headers.host;
   const wsUrl = `wss://${host}/ws`;
@@ -37,36 +34,27 @@ app.post("/voice", (req, res) => {
   res.type("text/xml").send(twiml);
 });
 
-/* =========================
-   HTTP SERVER
-========================= */
 const server = http.createServer(app);
 
-/* =========================
-   WEBSOCKET SERVER (/ws)
-========================= */
 const wss = new WebSocketServer({ noServer: true });
-
 server.on("upgrade", (req, socket, head) => {
   console.log("⬆️ UPGRADE hit url=", req.url);
   if (req.url === "/ws") {
-    wss.handleUpgrade(req, socket, head, (ws) => {
-      wss.emit("connection", ws, req);
-    });
+    wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
   } else {
     socket.destroy();
   }
 });
 
-/* =========================
-   WS CONNECTION
-========================= */
 wss.on("connection", (twilioWs) => {
   console.log("✅ Twilio WS connected");
 
   let streamSid = null;
 
-  /* ---- OpenAI Realtime WS ---- */
+  // Queue des audio chunks Twilio tant que OpenAI n'est pas ready
+  const audioQueue = [];
+  let openaiIsOpen = false;
+
   const openaiWs = new WebSocket(
     "wss://api.openai.com/v1/realtime?model=gpt-realtime",
     {
@@ -77,43 +65,61 @@ wss.on("connection", (twilioWs) => {
     }
   );
 
+  const safeSendOpenAI = (obj) => {
+    if (openaiWs.readyState === WebSocket.OPEN) {
+      openaiWs.send(JSON.stringify(obj));
+      return true;
+    }
+    return false;
+  };
+
+  const flushQueueToOpenAI = () => {
+    if (!openaiIsOpen) return;
+    if (openaiWs.readyState !== WebSocket.OPEN) return;
+
+    // On envoie en rafale les chunks accumulés
+    while (audioQueue.length > 0) {
+      const payload = audioQueue.shift();
+      safeSendOpenAI({ type: "input_audio_buffer.append", audio: payload });
+    }
+  };
+
   openaiWs.on("open", () => {
     console.log("🧠 OpenAI Realtime connected");
+    openaiIsOpen = true;
 
-    /* ✅ CONFIG SESSION (VALID) */
-    openaiWs.send(
-      JSON.stringify({
-        type: "session.update",
-        session: {
-          output_modalities: ["audio", "text"],
-
-          instructions: `
+    // Session config VALID
+    safeSendOpenAI({
+      type: "session.update",
+      session: {
+        output_modalities: ["audio", "text"],
+        instructions: `
 Tu es l’agent téléphonique de ABC Déneigement.
 Langue : français canadien (fr-CA).
 Heures : lundi à vendredi 08h30–17h00. Fermé samedi et dimanche.
 Sois naturel, poli, humain.
 Si tu ne sais pas une information, dis-le et propose de transférer à un superviseur.
-          `,
-
-          audio: {
-            input: {
-              format: { type: "audio/pcmu" }, // Twilio = G.711 μ-law
-              turn_detection: {
-                type: "server_vad",
-                silence_duration_ms: 500,
-              },
-            },
-            output: {
-              format: { type: "audio/pcmu" },
-              voice: "marin", // voix OpenAI
+        `,
+        audio: {
+          input: {
+            format: { type: "audio/pcmu" },
+            turn_detection: {
+              type: "server_vad",
+              silence_duration_ms: 500,
             },
           },
+          output: {
+            format: { type: "audio/pcmu" },
+            voice: "marin",
+          },
         },
-      })
-    );
+      },
+    });
+
+    // Dès que c'est prêt, on flush les chunks déjà reçus
+    flushQueueToOpenAI();
   });
 
-  /* ---- OPENAI → TWILIO AUDIO ---- */
   openaiWs.on("message", (data) => {
     let msg;
     try {
@@ -127,19 +133,13 @@ Si tu ne sais pas une information, dis-le et propose de transférer à un superv
       return;
     }
 
-    /* 🔊 AUDIO QUI PARLE (LE POINT CLÉ) */
-    if (
-      msg.type === "response.output_audio.delta" &&
-      msg.delta &&
-      streamSid
-    ) {
+    // 🔊 Audio OpenAI -> Twilio
+    if (msg.type === "response.output_audio.delta" && msg.delta && streamSid) {
       twilioWs.send(
         JSON.stringify({
           event: "media",
           streamSid,
-          media: {
-            payload: msg.delta, // base64 pcmu
-          },
+          media: { payload: msg.delta },
         })
       );
     }
@@ -149,7 +149,15 @@ Si tu ne sais pas une information, dis-le et propose de transférer à un superv
     }
   });
 
-  /* ---- TWILIO → OPENAI AUDIO ---- */
+  openaiWs.on("close", () => {
+    console.log("🧠 OpenAI Realtime disconnected");
+  });
+
+  openaiWs.on("error", (e) => {
+    console.error("OpenAI WS error:", e);
+  });
+
+  // Twilio -> OpenAI
   twilioWs.on("message", (data) => {
     let msg;
     try {
@@ -165,12 +173,19 @@ Si tu ne sais pas une information, dis-le et propose de transférer à un superv
     }
 
     if (msg.event === "media" && msg.media?.payload) {
-      openaiWs.send(
-        JSON.stringify({
-          type: "input_audio_buffer.append",
-          audio: msg.media.payload,
-        })
-      );
+      const payload = msg.media.payload;
+
+      // Si OpenAI pas encore OPEN: on queue
+      if (openaiWs.readyState !== WebSocket.OPEN) {
+        audioQueue.push(payload);
+
+        // Evite que ça grossisse trop si OpenAI met du temps
+        if (audioQueue.length > 200) audioQueue.shift();
+        return;
+      }
+
+      // Sinon on envoie direct
+      safeSendOpenAI({ type: "input_audio_buffer.append", audio: payload });
       return;
     }
 
@@ -179,6 +194,7 @@ Si tu ne sais pas une information, dis-le et propose de transférer à un superv
       try {
         openaiWs.close();
       } catch {}
+      return;
     }
   });
 
@@ -189,15 +205,9 @@ Si tu ne sais pas une information, dis-le et propose de transférer à un superv
     } catch {}
   });
 
-  openaiWs.on("close", () => {
-    console.log("🧠 OpenAI Realtime disconnected");
-  });
+  twilioWs.on("error", (e) => console.error("Twilio WS error:", e));
 });
 
-/* =========================
-   LISTEN
-========================= */
 const PORT = process.env.PORT || 8080;
-server.listen(PORT, () => {
-  console.log("🚀 Server listening on", PORT);
-});
+server.listen(PORT, () => console.log("🚀 Server listening on", PORT));
+
