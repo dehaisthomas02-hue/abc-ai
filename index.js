@@ -80,3 +80,8 @@ wss.on("connection", (ws) => {
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => console.log(`🚀 Server listening on ${PORT}`));
 
+app.get("/ping", (req, res) => {
+  process.stdout.write("🏓 /ping hit\n");
+  res.status(200).send("pong");
+});
+
