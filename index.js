@@ -17,7 +17,7 @@ app.post("/voice", (req, res) => {
   <Start>
     <Stream url="${wsUrl}" />
   </Start>
-  <Say>Bienvenue chez ABC Déneigement. Un agent virtuel va vous répondre.</Say>
+  <Say voice="Polly.Gabrielle-Neural" language="fr-CA">Bienvenue chez ABC Déneigement. Dites-moi comment je peux vous aider.</Say>
   <Pause length="60"/>
 </Response>`;
 
