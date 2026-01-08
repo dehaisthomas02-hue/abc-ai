@@ -123,40 +123,29 @@ Règles importantes :
 
   // 🎧 Audio Twilio → OpenAI
   twilioWs.on("message", (msg) => {
-    const data = JSON.parse(msg.toString());
+  const data = JSON.parse(msg.toString());
 
-    if (data.event === "start") {
-      streamSid = data.start.streamSid;
-      process.stdout.write("▶️ Twilio stream start\n");
-      return;
-    }
+  if (data.event === "start") {
+    streamSid = data.start.streamSid;
+    process.stdout.write("▶️ Twilio stream start\n");
+    return;
+  }
 
-    if (data.event === "media") {
-      openaiWs.send(
-        JSON.stringify({
-          type: "input_audio_buffer.append",
-          audio: data.media.payload,
-        })
-      );
-      return;
-    }
+  if (data.event === "media") {
+    openaiWs.send(
+      JSON.stringify({
+        type: "input_audio_buffer.append",
+        audio: data.media.payload,
+      })
+    );
+    return;
+  }
 
-if (data.event === "stop") {
-  process.stdout.write("⏹️ Twilio stream stop\n");
+  if (data.event === "stop") {
+    process.stdout.write("⏹️ Twilio stream stop\n");
 
-  // 🔊 DEMANDER À L’AI DE RÉPONDRE
-  openaiWs.send(JSON.stringify({ type: "response.create" }));
-}
-
-    }
-  });
-
-  twilioWs.on("close", () => {
-    process.stdout.write("❌ Twilio WS disconnected\n");
-    try {
-      openaiWs.close();
-    } catch {}
-  });
+    // 🔊 DEMANDER À L’AI DE RÉPONDRE
+    openaiWs.send(JSON.stringify({ type: "response.create" }));
+    return;
+  }
 });
-
-
