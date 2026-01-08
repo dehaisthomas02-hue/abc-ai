@@ -141,9 +141,13 @@ Règles importantes :
       return;
     }
 
-    if (data.event === "stop") {
-      process.stdout.write("⏹️ Twilio stream stop\n");
-      openaiWs.close();
+if (data.event === "stop") {
+  process.stdout.write("⏹️ Twilio stream stop\n");
+
+  // 🔊 DEMANDER À L’AI DE RÉPONDRE
+  openaiWs.send(JSON.stringify({ type: "response.create" }));
+}
+
     }
   });
 
